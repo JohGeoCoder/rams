@@ -4,6 +4,8 @@ import re
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 
+from sqlalchemy.sql.elements import not_
+
 from pockets import cached_property, classproperty, groupify, listify, is_listy, readable_join
 from pockets.autolog import log
 from pytz import UTC
@@ -932,6 +934,14 @@ class Attendee(MagModel, TakesPaymentMixin):
     @is_unassigned.expression
     def is_unassigned(cls):
         return cls.first_name == ''
+
+    @hybrid_property
+    def is_valid(self):
+        return self.badge_status not in [c.PENDING_STATUS, c.INVALID_STATUS]
+
+    @is_valid.expression
+    def is_valid(cls):
+        return not_(cls.badge_status.in_([c.PENDING_STATUS, c.INVALID_STATUS]))
 
     @property
     def volunteering_badge_or_ribbon(self):

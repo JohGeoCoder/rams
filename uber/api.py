@@ -22,8 +22,8 @@ from uber.barcode import get_badge_num_from_barcode
 from uber.config import c
 from uber.decorators import department_id_adapter
 from uber.errors import CSRFException
-from uber.models import AdminAccount, ApiToken, Attendee, Department, DeptMembership, DeptMembershipRequest, \
-    Event, IndieStudio, Job, Session, Shift, GuestGroup, Room, HotelRequests, RoomAssignment
+from uber.models import AdminAccount, ApiToken, Attendee, AttendeeAccount, Department, DeptMembership, DeptMembershipRequest, \
+    Event, IndieStudio, Job, Session, Shift, Group, GuestGroup, Room, HotelRequests, RoomAssignment
 from uber.models.badge_printing import PrintJob
 from uber.server import register_jsonrpc
 from uber.utils import check, check_csrf, normalize_email, normalize_newlines
@@ -63,6 +63,120 @@ def _attendee_fields_and_query(full, query):
         fields = AttendeeLookup.fields
         query = query.options(subqueryload(Attendee.dept_memberships))
     return (fields, query)
+
+
+def _prepare_attendees_export(attendees, include_account_ids=False, include_apps=False, include_depts=False, is_group_attendee=False):
+    # If we add API classes for these models later, please move the field lists accordingly
+    art_show_import_fields = [
+        'artist_name',
+        'artist_id',
+        'banner_name',
+        'description',
+        'business_name',
+        'zip_code',
+        'address1',
+        'address2',
+        'city',
+        'region',
+        'country',
+        'paypal_address',
+        'website',
+        'special_needs',
+        'admin_notes',
+    ]
+    
+    marketplace_import_fields = [
+        'business_name',
+        'categories',
+        'categories_text',
+        'description',
+        'special_needs',
+        'admin_notes',
+    ]
+
+    fields = AttendeeLookup.attendee_import_fields + Attendee.import_fields
+            
+    if include_depts or include_apps:
+        fields.extend(['shirt'])
+
+    if is_group_attendee:
+        fields.extend(AttendeeLookup.group_attendee_import_fields)
+
+    attendee_list = []
+    for a in attendees:
+        d = a.to_dict(fields)
+
+        if include_account_ids and a.managers:
+            d['attendee_account_ids'] = [m.id for m in a.managers]
+
+        if include_apps:
+            if a.art_show_applications:
+                d['art_show_app'] = a.art_show_applications[0].to_dict(art_show_import_fields)
+            if a.marketplace_applications:
+                d['marketplace_app'] = a.marketplace_applications[0].to_dict(marketplace_import_fields)
+        
+        if include_depts:
+            assigned_depts = {}
+            checklist_admin_depts = {}
+            dept_head_depts = {}
+            poc_depts = {}
+            for membership in a.dept_memberships:
+                assigned_depts[membership.department_id] = membership.department.name
+                if membership.is_checklist_admin:
+                    checklist_admin_depts[membership.department_id] = membership.department.name
+                if membership.is_dept_head:
+                    dept_head_depts[membership.department_id] = membership.department.name
+                if membership.is_poc:
+                    poc_depts[membership.department_id] = membership.department.name
+
+            d.update({
+                'assigned_depts': assigned_depts,
+                'checklist_admin_depts': checklist_admin_depts,
+                'dept_head_depts': dept_head_depts,
+                'poc_depts': poc_depts,
+                'requested_depts': {
+                    (m.department_id if m.department_id else 'All'):
+                    (m.department.name if m.department_id else 'Anywhere')
+                    for m in a.dept_membership_requests},
+            })
+        
+        attendee_list.append(d)
+    return attendee_list
+
+
+def _query_to_names_emails_ids(query, split_names=True):
+    _re_name_email = re.compile(r'^\s*(.*?)\s*<\s*(.*?@.*?)\s*>\s*$')
+    _re_sep = re.compile(r'[\n,]')
+    _re_whitespace = re.compile(r'\s+')
+    queries = [s.strip() for s in _re_sep.split(normalize_newlines(query)) if s.strip()]
+
+    names = dict()
+    emails = dict()
+    names_and_emails = dict()
+    ids = set()
+    for q in queries:
+        if '@' in q:
+            match = _re_name_email.match(q)
+            if match:
+                name = match.group(1)
+                email = normalize_email(match.group(2))
+                if name:
+                    first, last = (_re_whitespace.split(name.lower(), 1) + [''])[0:2]
+                    names_and_emails[(first, last, email)] = q
+                else:
+                    emails[email] = q
+            else:
+                emails[normalize_email(q)] = q
+        elif q:
+            try:
+                ids.add(str(uuid.UUID(q)))
+            except Exception:
+                if split_names:
+                    first, last = (_re_whitespace.split(q.lower(), 1) + [''])[0:2]
+                    names[(first, last)] = q
+                else:
+                    names[q] = q
+    return names, emails, names_and_emails, ids
 
 
 def _parse_datetime(d):
@@ -206,11 +320,9 @@ class GuestLookup:
     def list(self, type=None):
         """
         Returns a list of Guests.
-
         Optionally, 'type' may be passed to limit the results to a specific
         guest type.  For a full list of guest types, call the "guest.types"
         method.
-
         """
         with Session() as session:
             if type and type.upper() in c.GROUP_TYPE_VARS:
@@ -248,13 +360,10 @@ class MivsLookup:
     def list(self, status=False):
         """
         Returns a list of MIVS studios and their developers.
-
         Optionally, 'status' may be passed to limit the results to MIVS
         studios with a specific status. Use 'confirmed' to get MIVS teams
         who are attending the event.
-
         For a full list of statuses, call the "mivs.statuses" method.
-
         """
         with Session() as session:
             if status and status.upper() in c.MIVS_STUDIO_STATUS_VARS:
@@ -273,6 +382,11 @@ class AttendeeLookup:
         'legal_name': True,
         'email': True,
         'zip_code': True,
+        'address1': True,
+        'address2': True,
+        'city': True,
+        'region': True,
+        'country': True,
         'cellphone': True,
         'ec_name': True,
         'ec_phone': True,
@@ -313,12 +427,43 @@ class AttendeeLookup:
         },
     })
 
+    attendee_import_fields = [
+        'first_name',
+        'last_name',
+        'legal_name',
+        'birthdate',
+        'email',
+        'zip_code',
+        'address1',
+        'address2',
+        'city',
+        'region',
+        'country',
+        'birthdate',
+        'international',
+        'ec_name',
+        'ec_phone',
+        'cellphone',
+        'badge_printed_name',
+        'found_how',
+        'comments',
+        'admin_notes',
+        'all_years',
+        'badge_status',
+        'badge_status_label',
+    ]
+
+    group_attendee_import_fields = [
+        'placeholder',
+        'paid',
+        'badge_type',
+        'ribbon',
+    ]
+
     def lookup(self, badge_num, full=False):
         """
         Returns a single attendee by badge number.
-
         Takes the badge number as the first parameter.
-
         Optionally, "full" may be passed as the second parameter to return the
         complete attendee record, including departments, shifts, and food
         restrictions.
@@ -337,15 +482,15 @@ class AttendeeLookup:
         Searches for attendees using a freeform text query. Returns all
         matching attendees using the same search algorithm as the main
         attendee search box.
-
         Takes the search query as the first parameter.
-
         Optionally, "full" may be passed as the second parameter to return the
         complete attendee record, including departments, shifts, and food
         restrictions.
         """
         with Session() as session:
-            attendee_query = session.search(query)
+            attendee_query, error = session.search(query)
+            if error:
+                raise HTTPError(400, error)
             fields, attendee_query = _attendee_fields_and_query(full, attendee_query)
             return [a.to_dict(fields) for a in attendee_query.limit(100)]
         
@@ -396,44 +541,14 @@ class AttendeeLookup:
         """
         Searches for attendees by either email, "first last" name, or
         "first last &lt;email&gt;" combinations.
-
         `query` should be a comma or newline separated list of email/name
         queries.
-
         Example:
         <pre>Merrium Webster, only.email@example.com, John Doe &lt;jdoe@example.com&gt;</pre>
-
         Results are returned in the format expected by
-        <a href="../import/staff">the staff importer</a>.
+        <a href="../reg_admin/import_attendees">the attendee importer</a>.
         """
-        _re_name_email = re.compile(r'^\s*(.*?)\s*<\s*(.*?@.*?)\s*>\s*$')
-        _re_sep = re.compile(r'[\n,]')
-        _re_whitespace = re.compile(r'\s+')
-        queries = [s.strip() for s in _re_sep.split(normalize_newlines(query)) if s.strip()]
-
-        names = dict()
-        emails = dict()
-        names_and_emails = dict()
-        ids = set()
-        for q in queries:
-            if '@' in q:
-                match = _re_name_email.match(q)
-                if match:
-                    name = match.group(1)
-                    email = normalize_email(match.group(2))
-                    if name:
-                        first, last = (_re_whitespace.split(name.lower(), 1) + [''])[0:2]
-                        names_and_emails[(first, last, email)] = q
-                    else:
-                        emails[email] = q
-                else:
-                    emails[normalize_email(q)] = q
-            elif q:
-                try:
-                    ids.add(str(uuid.UUID(q)))
-                except Exception:
-                    first, last = (_re_whitespace.split(q.lower(), 1) + [''])[0:2]
-                    names[(first, last)] = q
+        names, emails, names_and_emails, ids = _query_to_names_emails_ids(query)
 
         with Session() as session:
             if full:
@@ -491,56 +606,11 @@ class AttendeeLookup:
                 a for a in (id_attendees + email_attendees + name_attendees + name_and_email_attendees)
                 if a.id not in seen and not seen.add(a.id)]
 
-            fields = [
-                'first_name',
-                'last_name',
-                'birthdate',
-                'email',
-                'zip_code',
-                'birthdate',
-                'international',
-                'ec_name',
-                'ec_phone',
-                'cellphone',
-                'badge_printed_name',
-                'found_how',
-                'comments',
-                'admin_notes',
-                'all_years',
-                'badge_status',
-                'badge_status_label',
-            ]
+            fields = AttendeeLookup.attendee_import_fields + Attendee.import_fields
             if full:
                 fields.extend(['shirt'])
 
-            attendees = []
-            for a in all_attendees:
-                d = a.to_dict(fields)
-                if full:
-                    assigned_depts = {}
-                    checklist_admin_depts = {}
-                    dept_head_depts = {}
-                    poc_depts = {}
-                    for membership in a.dept_memberships:
-                        assigned_depts[membership.department_id] = membership.department.name
-                        if membership.is_checklist_admin:
-                            checklist_admin_depts[membership.department_id] = membership.department.name
-                        if membership.is_dept_head:
-                            dept_head_depts[membership.department_id] = membership.department.name
-                        if membership.is_poc:
-                            poc_depts[membership.department_id] = membership.department.name
-
-                    d.update({
-                        'assigned_depts': assigned_depts,
-                        'checklist_admin_depts': checklist_admin_depts,
-                        'dept_head_depts': dept_head_depts,
-                        'poc_depts': poc_depts,
-                        'requested_depts': {
-                            (m.department_id if m.department_id else 'All'):
-                            (m.department.name if m.department_id else 'Anywhere')
-                            for m in a.dept_membership_requests},
-                    })
-                attendees.append(d)
+            attendees = _prepare_attendees_export(all_attendees, include_depts=full, include_account_ids=full)
 
             return {
                 'unknown_ids': unknown_ids,
@@ -554,11 +624,9 @@ class AttendeeLookup:
     def create(self, first_name, last_name, email, params):
         """
         Create an attendee with at least a first name, last name, and email. Prevents duplicate attendees.
-
         `params` should be a dictionary with column name: value to set other values, or a falsey value.
         Use labels for Choice and MultiChoice columns, and a string like "no" or "yes" for Boolean columns.
         Date and DateTime columns should be parsed correctly as long as they follow a standard format.
-
         Example `params` dictionary for setting extra parameters:
         <pre>{"placeholder": "yes", "legal_name": "First Last", "cellphone": "5555555555"}</pre>
         """
@@ -596,11 +664,9 @@ class AttendeeLookup:
     def update(self, id, params):
         """
         Update an attendee using their unique ID, returned by our lookup functions.
-
         `params` should be a dictionary with column name: value to update values.
         Use labels for Choice and MultiChoice columns, and a string like "no" or "yes" for Boolean columns.
         Date and DateTime columns should be parsed correctly as long as they follow a standard format.
-
         Example:
         <pre>{"first_name": "First", "paid": "doesn't need to", "ribbon": "Volunteer, Panelist"}</pre>
         """
@@ -631,6 +697,90 @@ class AttendeeLookup:
             return attendee.id
 
 
+@all_api_auth('api_read')
+class AttendeeAccountLookup:
+    def export_attendees(self, id, full=False, include_group=False):
+        """
+        Exports attendees by their attendee account ID.
+        `id` is the UUID of the account.
+        
+        `full` includes the attendee's individual applications, such as art show.
+        `include_group` exports attendees in groups. This should be done rarely, as
+        you should be importing groups with their attendees before importing accounts.
+        Results are returned in the format expected by
+        <a href="../reg_admin/import_attendees">the attendee importer</a>.
+        """
+
+        with Session() as session:
+            account = session.query(AttendeeAccount).filter(AttendeeAccount.id == id).first()
+
+            if not account:
+                raise HTTPError(404, 'No attendee account found with this ID')
+
+            attendees_to_export = account.valid_attendees if include_group else [a for a in account.attendees if not a.group]
+
+            attendees = _prepare_attendees_export(attendees_to_export, include_apps=full)
+            return {
+                'attendees': attendees,
+            }
+
+    def export(self, query, all=False):
+        """
+        Searches for attendee accounts by either email or id.
+        `query` should be a comma or newline separated list of email/id
+        queries.
+        `all` ignores the query and returns all attendee accounts.
+        Example:
+        <pre>account.email@example.com, e3a670c4-8f7e-4d62-841d-49f73f58d8b1</pre>
+        """
+        names, emails, names_and_emails, ids = _query_to_names_emails_ids(query)
+        unknown_emails = []
+        unknown_ids = []
+
+        with Session() as session:
+            if all:
+                all_accounts = session.query(AttendeeAccount).all()
+            else:
+                email_accounts = []
+                if emails:
+                    email_accounts = session.query(AttendeeAccount).filter(AttendeeAccount.normalized_email.in_(list(emails.keys()))) \
+                        .options(subqueryload(AttendeeAccount.attendees)).order_by(AttendeeAccount.email, AttendeeAccount.id).all()
+
+                known_emails = set(a.normalized_email for a in email_accounts)
+                unknown_emails = sorted([raw for normalized, raw in emails.items() if normalized not in known_emails])
+
+                id_accounts = []
+                if ids:
+                    id_accounts = session.query(AttendeeAccount).filter(AttendeeAccount.id.in_(ids)) \
+                        .options(subqueryload(AttendeeAccount.attendees)).order_by(AttendeeAccount.email, AttendeeAccount.id).all()
+
+                known_ids = set(str(a.id) for a in id_accounts)
+                unknown_ids = sorted([i for i in ids if i not in known_ids])
+
+                seen = set()
+                all_accounts = [
+                    a for a in (id_accounts + email_accounts)
+                    if a.id not in seen and not seen.add(a.id)]
+
+            accounts = []
+            for a in all_accounts:
+                d = a.to_dict(['id', 'email', 'hashed'])
+
+                attendees = {}
+                for attendee in a.attendees:
+                    attendees[attendee.id] = attendee.full_name + " <{}>".format(attendee.email)
+                    
+                d.update({
+                    'attendees': attendees,
+                })
+                accounts.append(d)
+
+            return {
+                'unknown_ids': unknown_ids,
+                'unknown_emails': unknown_emails,
+                'accounts': accounts,
+            }
+
 @all_api_auth('api_update')
 class JobLookup:
     fields = {
@@ -660,16 +810,13 @@ class JobLookup:
     def lookup(self, department_id, start_time=None, end_time=None):
         """
         Returns a list of all shifts for the given department.
-
         Takes the department id as the first parameter. For a list of all
         department ids call the "dept.list" method.
-
         Optionally, takes a "start_time" and "end_time" to constrain the
         results to a given date range. Dates may be given in any format
         supported by the
         <a href="http://dateutil.readthedocs.io/en/stable/parser.html">
         dateutil parser</a>, plus the string "now".
-
         Unless otherwise specified, "start_time" and "end_time" are assumed
         to be in the local timezone of the event.
         """
@@ -689,7 +836,6 @@ class JobLookup:
     def assign(self, job_id, attendee_id):
         """
         Assigns a shift for the given job to the given attendee.
-
         Takes the job id and attendee id as parameters.
         """
         with Session() as session:
@@ -703,7 +849,6 @@ class JobLookup:
     def unassign(self, shift_id):
         """
         Unassigns whomever is working the given shift.
-
         Takes the shift id as the only parameter.
         """
         with Session() as session:
@@ -721,12 +866,9 @@ class JobLookup:
     def set_worked(self, shift_id, status=c.SHIFT_WORKED, rating=c.UNRATED, comment=''):
         """
         Sets the given shift status as worked or not worked.
-
         Takes the shift id as the first parameter.
-
         Optionally takes the shift status, rating, and a comment required to
         explain either poor or excellent performance.
-
         <h6>Valid status values</h6>
         {}
         <h6>Valid rating values</h6>
@@ -761,19 +903,214 @@ class JobLookup:
 
 
 @all_api_auth('api_read')
+class GroupLookup:
+    fields = {
+        'name': True,
+        'badges': True,
+        'admin_notes': True,
+        'can_add': True,
+    }
+
+    dealer_fields = dict(fields, **{
+        'tables': True,
+        'wares': True,
+        'description': True,
+        'zip_code': True,
+        'address1': True,
+        'address2': True,
+        'city': True,
+        'region': True,
+        'country': True,
+        'website': True,
+        'special_needs': True,
+        'categories': True,
+        'categories_text': True,
+    })
+
+    group_import_fields = [
+        'name',
+        'admin_notes',
+        'badges',
+        'can_add',
+    ]
+
+    dealer_import_fields = [
+        'tables',
+        'wares',
+        'description',
+        'zip_code',
+        'address1',
+        'address2',
+        'city',
+        'region',
+        'country',
+        'website',
+        'special_needs',
+        'categories',
+        'categories_text',
+    ]
+
+    def dealers(self, status=None):
+        """
+        Returns a list of Groups that are also dealers.
+        Optionally, `status` may be passed to limit the results to dealers with a specific
+        status.
+        """
+        with Session() as session:
+            filters = [Group.is_dealer == True]
+            if status and status.upper() in c.DEALER_STATUS_VARS:
+                filters += [Group.status == getattr(c, status.upper())]
+            query = session.query(Group).filter(*filters)
+            groups = []
+
+            for g in query.all():
+                d = g.to_dict(['id'] + GroupLookup.group_import_fields + Group.import_fields + GroupLookup.dealer_import_fields)
+
+                attendees = {}
+                for attendee in g.attendees:
+                    if not attendee.is_unassigned:
+                        attendees[attendee.id] = attendee.full_name + " <{}>".format(attendee.email)
+                    
+                d.update({
+                    'assigned_attendees': attendees,
+                })
+                groups.append(d)
+
+            return { 'groups': groups, }
+
+    def export_attendees(self, id, full=False):
+        """
+        Exports attendees by their group ID. Excludes unassigned attendees.
+        `id` is the UUID of the group.
+        
+        `full` includes the attendee's individual applications, such as art show.
+        Results are returned in the format expected by
+        <a href="../reg_admin/import_attendees">the attendee importer</a>.
+        
+        Attendee account IDs are also included so that group members can be imported 
+        with their accounts.
+        """
+
+        with Session() as session:
+            group = session.query(Group).filter(Group.id == id).first()
+
+            if not group:
+                raise HTTPError(404, 'No group found with this ID')
+
+            attendees_to_export = [a for a in group.attendees if not a.is_unassigned and a.is_valid]
+            attendees = _prepare_attendees_export(attendees_to_export, include_account_ids=True, include_apps=full, is_group_attendee=True)
+
+            if group.unassigned:
+                unassigned_badge_type = group.unassigned[0].badge_type
+                unassigned_ribbon = group.unassigned[0].ribbon
+            else:
+                unassigned_badge_type, unassigned_ribbon = c.ATTENDEE_BADGE, None
+
+            return {
+                'attendees': attendees,
+                'group_leader_id': group.leader.id,
+                'unassigned_badge_type': unassigned_badge_type,
+                'unassigned_ribbon': unassigned_ribbon,
+            }
+
+    def export(self, query, full=False):
+        """
+        Searches for groups by group name or ID.
+        `query` should be a comma or newline separated list of ID/name
+        queries.
+        Example:
+        <pre>Group Name, 962f1d9d-0799-4a4a-a346-7ab9e737f0a4</pre>
+        Results are returned in the format expected by
+        <a href="../reg_admin/import_groups">the group importer</a>.
+        """
+        names, emails, names_and_emails, ids = _query_to_names_emails_ids(query, split_names=False)
+
+        with Session() as session:
+            name_groups = []
+            if names:
+                name_groups = session.query(Group).filter(Group.name.in_(names)) \
+                    .order_by(Group.name).all()
+
+            known_names = set(str(a.name) for a in name_groups)
+            unknown_names = sorted([n for n in names if n not in known_names])
+
+            id_groups = []
+            if ids:
+                id_groups = session.query(Group).filter(Group.id.in_(ids)) \
+                    .order_by(Group.name).all()
+
+            known_ids = set(str(a.id) for a in id_groups)
+            unknown_ids = sorted([i for i in ids if i not in known_ids])
+
+            seen = set()
+            all_groups = [
+                a for a in (id_groups + name_groups)
+                if a.id not in seen and not seen.add(a.id)]
+
+            fields = GroupLookup.group_import_fields + Group.import_fields
+
+            groups = []
+            for g in all_groups:
+                if full and g.is_dealer:
+                    d = g.to_dict(fields + GroupLookup.dealer_import_fields)
+                else:
+                    d = g.to_dict(fields)
+
+                attendees = {}
+                for attendee in g.attendees:
+                    if not attendee.is_unassigned:
+                        attendees[attendee.id] = attendee.full_name + " <{}>".format(attendee.email)
+                    
+                d.update({
+                    'assigned_attendees': attendees,
+                })
+
+                groups.append(d)
+
+            return {
+                'unknown_ids': unknown_ids,
+                'unknown_names': unknown_names,
+                'groups': groups,
+            }
+
+@all_api_auth('api_read')
 class DepartmentLookup:
     def list(self):
         """
         Returns a list of department ids and names.
         """
         return c.DEPARTMENTS
+    
+    @department_id_adapter
+    @api_auth('api_read')
+    def members(self, department_id):
+        """
+        Returns an object with all members of this department broken down by their roles.
+        
+        Takes the department id as the only parameter.
+        """
+        with Session() as session:
+            department = session.query(Department).filter_by(id=department_id).first()
+            if not department:
+                raise HTTPError(404, 'Department id not found: {}'.format(department_id))
+            return department.to_dict({
+                'id': True,
+                'name': True,
+                'description': True,
+                'dept_roles': True,
+                'dept_heads': True,
+                'checklist_admins': True,
+                'members_with_inherent_role': True,
+                'members_who_can_admin_checklist': True,
+                'pocs': True,
+                'members': True
+            })
 
     @department_id_adapter
     @api_auth('api_read')
     def jobs(self, department_id):
         """
         Returns a list of all roles and jobs for the given department.
-
         Takes the department id as the first parameter. For a list of all
         department ids call the "dept.list" method.
         """
@@ -871,7 +1208,6 @@ class HotelLookup:
         Create or update a hotel room. If the id of an existing room is
         supplied then it will attempt to update an existing room.
         Possible attributes are notes, message, locked_in, nights, and created.
-
         Returns the created room, with its id.
         """
         with Session() as session:
@@ -894,7 +1230,6 @@ class HotelLookup:
         Create or update a hotel request. If the id is supplied then it will
         attempt to update the given request.
         Possible attributes are attendee_id, nights, wanted_roommates, unwanted_roommates, special_needs, and approved.
-
         Returns the created or updated request.
         """
         with Session() as session:
@@ -917,7 +1252,6 @@ class HotelLookup:
         Create or update a hotel room assignment. If the id is supplied then it will
         attempt to update the given request. Otherwise a new one is created.
         Possible attributes are room_id, and attendee_id.
-
         Returns the created or updated assignment.
         """
         with Session() as session:
@@ -974,9 +1308,7 @@ class BarcodeLookup:
     def lookup_attendee_from_barcode(self, barcode_value, full=False):
         """
         Returns a single attendee using the barcode value from their badge.
-
         Takes the (possibly encrypted) barcode value as the first parameter.
-
         Optionally, "full" may be passed as the second parameter to return the
         complete attendee record, including departments, shifts, and food
         restrictions.
@@ -1002,7 +1334,6 @@ class BarcodeLookup:
     def lookup_badge_number_from_barcode(self, barcode_value):
         """
         Returns a badge number using the barcode value from the given badge.
-
         Takes the (possibly encrypted) barcode value as a single parameter.
         """
         try:
@@ -1025,17 +1356,13 @@ class PrintJobLookup:
     def get_pending(self, printer_ids='', restart=False, dry_run=False):
         """
         Returns pending print jobs' `json_data`.
-
         Takes either a single printer ID or a comma-separated list of printer IDs as the first parameter.
         If this is set, only the print jobs whose printer_id match one of those in the list are returned.
-
         Takes the boolean `restart` as the second parameter.
         If true, pulls any print job that's not marked as printed or invalid.
         Otherwise, only print jobs not marked as sent to printer are returned.
-
         Takes the boolean `dry_run` as the third parameter.
         If true, pulls print jobs without marking them as sent to printer.
-
         Returns a dictionary of pending jobs' `json_data` plus job metadata, keyed by job ID.
         """
 
@@ -1075,7 +1402,6 @@ class PrintJobLookup:
         
         Takes a print_fee as an optional fourth parameter. If this is not specified, an error
         is returned unless this is the first time this attendee's badge is being printed.
-
         Returns a dictionary of the new job's `json_data` plus job metadata, keyed by job ID.
         """
         with Session() as session:
@@ -1098,11 +1424,8 @@ class PrintJobLookup:
     def add_error(self, job_ids, error):
         """
         Adds an error message to a print job, effectively marking it invalid.
-
         Takes either a single job ID or a comma-seperated list of job IDs as the first parameter.
-
         Takes the error message as the second parameter.
-
         Returns a dictionary of changed jobs' `json_data` plus job metadata, keyed by job ID.
         """
         with Session() as session:
@@ -1132,9 +1455,7 @@ class PrintJobLookup:
     def mark_complete(self, job_ids=''):
         """
         Marks print jobs as printed.
-
         Takes either a single job ID or a comma-separated list of job IDs as the first parameter.
-
         Returns a dictionary of changed jobs' `json_data` plus job metadata, keyed by job ID.
         """
         with Session() as session:
@@ -1163,16 +1484,12 @@ class PrintJobLookup:
     def clear_jobs(self, printer_ids='', all=False, invalidate=False, error=''):
         """
         Marks all pending print jobs as either printed or invalid, effectively clearing them from the queue.
-
         Takes either a single printer ID, comma-separated list of printer IDs, or empty string as the first parameter.
         If this is set, only the print jobs whose printer_id match one of those in the list are cleared.
-
         Takes the boolean `all` as the second parameter.
         If true, all jobs are cleared. Otherwise, at least one printer_id is required.
-
         Takes the boolean `invalidate` as the third parameter.
         If true, cleared jobs are marked invalid instead of printed (the default), marked with the parameter `error`.
-
         Returns a dictionary of changed jobs' `json_data` plus job metadata, keyed by job ID.
         """
         with Session() as session:
@@ -1208,6 +1525,8 @@ class PrintJobLookup:
 
 if c.API_ENABLED:
     register_jsonrpc(AttendeeLookup(), 'attendee')
+    register_jsonrpc(AttendeeAccountLookup(), 'attendee_account')
+    register_jsonrpc(GroupLookup(), 'group')
     register_jsonrpc(JobLookup(), 'shifts')
     register_jsonrpc(DepartmentLookup(), 'dept')
     register_jsonrpc(ConfigLookup(), 'config')
